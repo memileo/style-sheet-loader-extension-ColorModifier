@@ -10,8 +10,11 @@ Loads a Qt Style Sheet and applies it to the UI.
 <h3>Usage</h3>
 Tools->Scripts->Load Style Sheet.<br>
 Set the path to load a text file containing a Qt Style Sheet
-and apply it to the Krita window.
+and apply it to the Krita window.<br>
 If "Load on startup" is checked, this filepath will be saved in Krita's config 
-and loaded automatically on startup.
+and loaded automatically on startup.<br>
+If "Use folder resource prefix" is checked, the given text will be used as a resource prefix
+for the style sheet to find resources such as images in the same folder.
+For example with the "stylesheet" prefix in the line "image: url(stylesheet:icon.png);".
 </body>
 </html>

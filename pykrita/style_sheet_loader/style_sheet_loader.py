@@ -18,7 +18,9 @@ from krita import Extension
 from PyQt5.QtWidgets import QFileDialog, QMessageBox, QDialog, \
                             QVBoxLayout, QHBoxLayout, \
                             QWidget, QLabel, QPushButton, QLineEdit, QCheckBox
-from PyQt5.QtCore import QFile, QIODevice, QMimeDatabase, QFileInfo, pyqtSignal
+from PyQt5.QtCore import QFile, QIODevice, QMimeDatabase, QFileInfo, QDir, pyqtSignal
+
+import os.path
 
 EXTENSION_ID = 'pykrita_style_sheet_loader'
 MENU_ENTRY = 'Load Style Sheet'
@@ -35,6 +37,9 @@ class StyleSheetLoader(Extension):
         self.startupStyleSheet = Application.readSetting(PLUGIN_CONFIG, "startupStyleSheet", "")
         self.path = self.startupStyleSheet
         self.useStartup = self.startupStyleSheet != ""
+
+        self.customResourcePrefix = Application.readSetting(PLUGIN_CONFIG, "customResourcePrefix", "stylesheet")
+        self.searchInStyleSheetDir = Application.readSetting(PLUGIN_CONFIG, "useStyleSheetDirAsResourcePath", "True") == "True"
 
     def setup(self):
         appNotifier = Application.instance().notifier()
@@ -71,6 +76,20 @@ class StyleSheetLoader(Extension):
         self.startupCheckbox.setChecked(self.useStartup)
         self.startupCheckbox.clicked.connect(self.toggleLoadOnStartup)
         layout.addWidget(self.startupCheckbox)
+
+        resPrefixLayout = QHBoxLayout()
+        self.resPrefixEdit = QLineEdit(self.customResourcePrefix)
+        resPrefixLabel = QLabel("Use folder resource prefix:")
+        resPrefixLabel.setToolTip("Prefix used by the style sheet to look for resources such as images in the same folder")
+        self.useAsResourcePathCheckbox = QCheckBox()
+        self.useAsResourcePathCheckbox.setToolTip("Whether to add the style sheet's folder as a resource path")
+        self.useAsResourcePathCheckbox.setChecked(self.searchInStyleSheetDir)
+        self.useAsResourcePathCheckbox.clicked.connect(self.toggleResPath)
+        resPrefixLayout.addWidget(self.useAsResourcePathCheckbox)
+        resPrefixLayout.addWidget(resPrefixLabel)
+        resPrefixLayout.addWidget(self.resPrefixEdit)
+        self.resPrefixEdit.editingFinished.connect(self.setResPrefix)
+        layout.addLayout(resPrefixLayout)
 
         self.dialog = QDialog(Application.activeWindow().qwindow())
 
@@ -120,6 +139,8 @@ class StyleSheetLoader(Extension):
             data = file.readAll()
             file.close()
 
+            self.updateResPath()
+
             styleSheet = f"{str(data, 'utf-8')}"
             # There's not really a way to validate the stylesheet,
             # so just let it try to apply whatever's there.
@@ -150,3 +171,24 @@ class StyleSheetLoader(Extension):
         self.pathChanged.emit(path)
         # Just changing the path here, not toggling
         self.toggleLoadOnStartup(self.useStartup)
+
+    def toggleResPath(self, isChecked):
+        self.searchInStyleSheetDir = isChecked
+        valString = "True" if self.searchInStyleSheetDir else "False"
+        Application.writeSetting(PLUGIN_CONFIG, "useStyleSheetDirAsResourcePath", valString)
+
+        self.resPrefixEdit.setEnabled(self.searchInStyleSheetDir)
+
+        # Update the resource path and reload the stylesheet
+        self.lineEditImport()
+
+    def setResPrefix(self):
+        self.customResourcePrefix = self.resPrefixEdit.text()
+        # Update the resource path and reload the stylesheet
+        self.lineEditImport()
+
+    def updateResPath(self):
+        if self.searchInStyleSheetDir:
+            QDir.setSearchPaths(self.customResourcePrefix, [os.path.dirname(self.startupStyleSheet)])
+        else:
+            QDir.setSearchPaths(self.customResourcePrefix, [])
