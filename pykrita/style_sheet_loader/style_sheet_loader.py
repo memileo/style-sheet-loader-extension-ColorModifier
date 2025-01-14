@@ -77,7 +77,7 @@ class StyleSheetLoader(Extension):
 
     def __init__(self, parent):
         super().__init__(parent)
-        
+
         self.colorMode = Application.readSetting(PLUGIN_CONFIG, "colorMode", "RGB")
 
         self.startupStyleSheet = Application.readSetting(PLUGIN_CONFIG, "startupStyleSheet", "")
@@ -86,13 +86,24 @@ class StyleSheetLoader(Extension):
 
         self.customResourcePrefix = Application.readSetting(PLUGIN_CONFIG, "customResourcePrefix", "stylesheet")
         self.searchInStyleSheetDir = Application.readSetting(PLUGIN_CONFIG, "useStyleSheetDirAsResourcePath", "True") == "True"
+        
+        # Initialize the checkbox as a class variable
+        self.useAsResourcePathCheckbox = QCheckBox()
+        # Update resource path on initialization
+        self.updateResPath()
 
     def setup(self):
         appNotifier = Application.instance().notifier()
         appNotifier.setActive(True)
-
         appNotifier.windowCreated.connect(self.loadOnStartup)
 
+    def initialSetup(self):
+        print("Performing initial setup...")
+        self.updateResPath()
+        if self.startupStyleSheet:
+            print(f"Loading startup stylesheet: {self.startupStyleSheet}")
+            self.importStylesheet(self.startupStyleSheet, addContext=True)
+        
     def createActions(self, window):
         action = window.createAction(EXTENSION_ID, MENU_ENTRY, "tools/scripts")
         action.triggered.connect(self.showDialog)
@@ -178,45 +189,55 @@ class StyleSheetLoader(Extension):
         if not path:
             return
 
-        if not QFileInfo(path).exists():
-            self.showWarningMessage("\"%s\" does not exist!" % (path), addContext)
-            return
-
-        mimeType = QMimeDatabase().mimeTypeForFile(path)
-        if not mimeType.inherits("text/plain"):
-            self.showWarningMessage("\"%s\" does not appear to be a text file!" % (path), addContext)
-            return
-
-        file = QFile(path)
-        if file.open(QIODevice.ReadOnly):
-            data = file.readAll()
-            file.close()
-
+        try:
+            # Force update resource path before loading stylesheet
             self.updateResPath()
-
-            stylesheet = str(data, 'utf-8')
-            # Replace placeholders with RGB values
-            stylesheet = self.replace_placeholders(stylesheet)
-            # Correct image paths
-            stylesheet = self.correct_image_paths(stylesheet, os.path.dirname(path))
-            # Debugging: Print the stylesheet after replacing placeholders and correcting image paths
-            print("Stylesheet after processing:\n", stylesheet)
             
-            # Apply the stylesheet
-            # Add safety check for active window
-            active_window = Application.activeWindow()
-            if active_window is not None and hasattr(active_window, 'qwindow'):
-                try:
-                    active_window.qwindow().setStyleSheet(stylesheet)
-                except Exception as e:
-                    print(f"Failed to set stylesheet: {e}")
+            if not QFileInfo(path).exists():
+                self.showWarningMessage(f"\"{path}\" does not exist!", addContext)
+                return
+                    
+            mimeType = QMimeDatabase().mimeTypeForFile(path)
+            if not mimeType.inherits("text/plain"):
+                self.showWarningMessage("\"%s\" does not appear to be a text file!" % (path), addContext)
+                return
+
+            file = QFile(path)
+            if file.open(QIODevice.ReadOnly):
+                data = file.readAll()
+                file.close()
+
+                self.updateResPath()
+
+                stylesheet = str(data, 'utf-8')
+                # Replace placeholders with RGB values
+                stylesheet = self.replace_placeholders(stylesheet)
+                # Correct image paths
+                stylesheet = self.correct_image_paths(stylesheet, os.path.dirname(path))
+                # Debugging: Print the stylesheet after replacing placeholders and correcting image paths
+                print("Stylesheet after processing:\n", stylesheet)
+                
+                # Apply the stylesheet
+                # Add safety check for active window
+                active_window = Application.activeWindow()
+                if active_window is not None and hasattr(active_window, 'qwindow'):
+                    try:
+                        active_window.qwindow().setStyleSheet(stylesheet)
+                    except Exception as e:
+                        print(f"Failed to set stylesheet: {e}")
+                else:
+                    print("No active window available to apply stylesheet")
+
+                self.setPath(path)
             else:
-                print("No active window available to apply stylesheet")
-
-            self.setPath(path)
-        else:
-            self.showWarningMessage("Failed to open \"%s\"." % (path), addContext)
+                self.showWarningMessage("Failed to open \"%s\"." % (path), addContext)
+                
+             # Add debug information
+            print(f"Resource paths for prefix '{self.customResourcePrefix}': {QDir.searchPaths(self.customResourcePrefix)}")
             
+        except Exception as e:
+            print(f"Error importing stylesheet: {e}")
+            self.showWarningMessage(f"Error loading stylesheet: {str(e)}", addContext)
             
     def showWarningMessage(self, warning, addContext):
         if addContext:
@@ -253,17 +274,38 @@ class StyleSheetLoader(Extension):
 
         # Update the resource path and reload the stylesheet
         self.lineEditImport()
-
+        
+    def updateResPath(self):
+        try:
+            if self.searchInStyleSheetDir and self.startupStyleSheet:
+                resource_path = os.path.dirname(self.startupStyleSheet)
+                if os.path.exists(resource_path):
+                    QDir.setSearchPaths(self.customResourcePrefix, [resource_path])
+                    print(f"Resource path set to: {resource_path}")
+                    # Verify the search paths were set
+                    current_paths = QDir.searchPaths(self.customResourcePrefix)
+                    print(f"Verified search paths: {current_paths}")
+                    # Verify if specific image files exist
+                    for img in ['close-light.svg', 'normal-light.svg', 'minimize-light.svg', 'maximize-light.svg']:
+                        full_path = os.path.join(resource_path, 'images', img)
+                        print(f"Checking image file: {full_path} - Exists: {os.path.exists(full_path)}")
+                else:
+                    print(f"Warning: Resource path does not exist: {resource_path}")
+            else:
+                QDir.setSearchPaths(self.customResourcePrefix, [])
+                print("Resource paths cleared")
+        except Exception as e:
+            print(f"Error updating resource path: {e}")
+            
     def setResPrefix(self):
         self.customResourcePrefix = self.resPrefixEdit.text()
+        # Write the updated resource prefix to settings
+        Application.writeSetting(PLUGIN_CONFIG, "customResourcePrefix", self.customResourcePrefix)
         # Update the resource path and reload the stylesheet
-        self.lineEditImport()
+        self.updateResPath()
+        if self.path:
+            self.lineEditImport()
 
-    def updateResPath(self):
-        if self.searchInStyleSheetDir:
-            QDir.setSearchPaths(self.customResourcePrefix, [os.path.dirname(self.startupStyleSheet)])
-        else:
-            QDir.setSearchPaths(self.customResourcePrefix, [])
 
     def setColorMode(self, mode):
         self.colorMode = mode
@@ -315,17 +357,32 @@ class StyleSheetLoader(Extension):
 
     def correct_image_paths(self, stylesheet, base_path):
         """
-        Ensures that any relative paths in the stylesheet are converted to absolute paths
-        based on the base path of the stylesheet file.
+        Ensures that any relative paths in the stylesheet are converted to the correct format
+        using the resource prefix system.
         """
+        print(f"Processing stylesheet paths with base_path: {base_path}")
+        print(f"Current resource prefix: {self.customResourcePrefix}")
+        print(f"Search paths before correction: {QDir.searchPaths(self.customResourcePrefix)}")
+
         pattern = re.compile(r'url\(([^)]+)\)')
 
         def replace_url(match):
             url = match.group(1).strip('\'"')
-            if not os.path.isabs(url):
-                url = os.path.join(base_path, url)
-            # Remove 'stylesheet:' prefix if present
-            url = url.replace('stylesheet:', '')
+            
+            # If the URL already starts with the resource prefix, leave it as is
+            if url.startswith(f'{self.customResourcePrefix}:'):
+                print(f"URL already has prefix: {url}")
+                return f"url('{url}')"
+                
+            # If it's a relative path and we're using resource paths
+            if not os.path.isabs(url) and self.useAsResourcePathCheckbox.isChecked():
+                # Just add the resource prefix
+                url = f"{self.customResourcePrefix}:{url}"
+            else:
+                # For absolute paths or when not using resource system
+                url = os.path.join(base_path, url).replace('\\', '/')
+
+            print(f"Corrected URL: {url}")
             return f"url('{url}')"
 
         return pattern.sub(replace_url, stylesheet)
