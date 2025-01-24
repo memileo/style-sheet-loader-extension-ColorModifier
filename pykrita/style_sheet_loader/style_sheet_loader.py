@@ -18,6 +18,8 @@
 
 import re
 import os.path
+import hashlib
+import xml.etree.ElementTree as ET
 from krita import Extension
 from PyQt5.QtWidgets import QFileDialog, QMessageBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QCheckBox, QApplication, QComboBox
 from PyQt5.QtGui import QPalette, QColor
@@ -26,7 +28,7 @@ from PyQt5.QtCore import QFile, QIODevice, QMimeDatabase, QFileInfo, QDir, pyqtS
 EXTENSION_ID = 'pykrita_style_sheet_loader'
 MENU_ENTRY = 'Load Style Sheet'
 DEBUG_MODE = False
-PRINT_STYLESHEET = True
+PRINT_STYLESHEET = False
 
 # Constant string for the config group in kritarc
 PLUGIN_CONFIG = "plugin/StyleSheetLoader"
@@ -79,12 +81,16 @@ def normalize_hue(h):
     return int(h % 360 if h >= 0 else 360 + (h % 360))
 
 def clip_value(value, min_val=0, max_val=None):
-    # Clip value between min and max.
-    if value < min_val:
+    """Clip value between min and max."""
+    try:
+        value = float(value)
+        if value < min_val:
+            return min_val
+        if max_val is not None and value > max_val:
+            return max_val
+        return value
+    except (TypeError, ValueError):
         return min_val
-    if max_val is not None and value > max_val:
-        return max_val
-    return value
 
 def parse_color_params(param_str):
     # Parse the color parameters string and return a dictionary of values.
@@ -126,25 +132,37 @@ def calculate_color(base_rgb, color_mode="RGB", h_shift=0, s_mult=1.0, l_mult=1.
     if color_mode == "RGB":
         # In RGB mode, only use lightness multiplier
         rgb_values = tuple(max(0, min(255, int(v * l_mult))) for v in base_rgb)
-        return rgb_values, clip_value(alpha, 0, 1)
+        return rgb_values, clip_value(alpha, 0, 1)  # Ensure alpha is clipped between 0 and 1
     else:
         # Convert to HSL, apply modifications, then convert back to RGB
         h, s, l = rgb_to_hsl(*base_rgb)
         
         # Apply modifications
         new_h = normalize_hue(h + h_shift)
-        new_s = clip_value(s * s_mult, 0, 100) # Clip to 100%
-        new_l = clip_value(l * l_mult, 0 , 100) # Clip to 100%
+        new_s = clip_value(s * s_mult, 0, 100)
+        new_l = clip_value(l * l_mult, 0, 100)
         
         # Convert back to RGB
         new_rgb = hsl_to_rgb(new_h, new_s, new_l)
-        return new_rgb, clip_value(alpha, 0, 1)
+        return new_rgb, clip_value(alpha, 0, 1)  # Ensure alpha is clipped between 0 and 1
+
+def clip_color_value(value, min_val=0, max_val=255):
+    """Clip color values to valid range"""
+    return max(min_val, min(max_val, int(round(value))))
 
 def hsl_to_rgb(h, s, l):
-    # Convert HSL values to RGB.
-    s = s / 100.0
-    l = l / 100.0
-    
+    """
+    Convert HSL to RGB with value clipping
+    h: 0-360
+    s: 0-100
+    l: 0-100
+    Returns: tuple (r, g, b) where r, g, b are 0-255
+    """
+    # Normalize values
+    h = float(h % 360)  # Ensure hue is 0-360
+    s = max(0, min(100, float(s))) / 100  # Convert to 0-1
+    l = max(0, min(100, float(l))) / 100  # Convert to 0-1
+
     def hue_to_rgb(p, q, t):
         if t < 0:
             t += 1
@@ -159,37 +177,224 @@ def hsl_to_rgb(h, s, l):
         return p
 
     if s == 0:
-        r = g = b = l
+        # Achromatic (grey)
+        rgb = l, l, l
     else:
         q = l * (1 + s) if l < 0.5 else l + s - l * s
         p = 2 * l - q
         
-        h = h / 360.0
+        h /= 360  # Normalize hue to 0-1
         r = hue_to_rgb(p, q, h + 1/3)
         g = hue_to_rgb(p, q, h)
         b = hue_to_rgb(p, q, h - 1/3)
+        rgb = (r, g, b)
 
-    return (int(r * 255), int(g * 255), int(b * 255))
+    # Convert to 8-bit values with clipping
+    return tuple(clip_color_value(x * 255) for x in rgb)
 
-    
+
+class SVGProcessor:
+    def __init__(self, base_path, resource_prefix="stylesheet", search_in_stylesheet_dir=True):
+        self.base_path = base_path
+        self.resource_prefix = resource_prefix
+        self.search_in_stylesheet_dir = search_in_stylesheet_dir
+        # Create temp directory for processed SVGs
+        self.temp_dir = os.path.join(self.base_path, '.processed_svg')
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def get_or_process_svg(self, svg_path, palette_color, color_params):
+        """Get processed SVG path or create new processed version"""
+        # Remove any existing prefix from the path
+        if svg_path.startswith(f'{self.resource_prefix}:'):
+            svg_path = svg_path[len(f'{self.resource_prefix}:'):]
+        
+        input_path = os.path.join(self.base_path, svg_path)
+        
+        # Create unique filename based on parameters
+        params_hash = hashlib.md5(f"{palette_color}:{color_params}".encode()).hexdigest()[:8]
+        base_name = os.path.splitext(os.path.basename(svg_path))[0]
+        output_filename = f"{base_name}_{params_hash}.svg"
+        output_path = os.path.join(self.temp_dir, output_filename)
+        
+        if not os.path.exists(output_path):
+            self.process_svg(input_path, output_path, palette_color, color_params)
+        
+        relative_path = os.path.relpath(output_path, self.base_path)
+        
+        if DEBUG_MODE:
+            print(f"[SVG] Processed SVG path: {relative_path}")
+            
+        return relative_path
+        
+
+    def process_svg(self, input_path, output_path, palette_color, color_params):
+        """Process SVG file and save with modified colors"""
+        try:
+            if DEBUG_MODE:
+                print(f"[SVG] Processing SVG file:")
+                print(f"[SVG]   Input: {input_path}")
+                print(f"[SVG]   Output: {output_path}")
+                print(f"[SVG]   Palette Color: {palette_color}")
+                if palette_color:
+                    print(f"[SVG]   Base RGB: {get_palette_rgb_values()[palette_color]}")
+                print(f"[SVG]   Color Params: {color_params}")
+
+            tree = ET.parse(input_path)
+            root = tree.getroot()
+            
+            base_rgb = get_palette_rgb_values()[palette_color] if palette_color else None
+            
+            for elem in root.iter():
+                if 'style' in elem.attrib:
+                    orig_style = elem.attrib['style']
+                    if DEBUG_MODE:
+                        print(f"[SVG]   Original style: {orig_style}")
+                    elem.attrib['style'] = self.transform_style_colors(orig_style, base_rgb, color_params)
+                    if DEBUG_MODE:
+                        print(f"[SVG]   Modified style: {elem.attrib['style']}")
+
+            tree.write(output_path, encoding='utf-8', xml_declaration=True)
+            
+        except Exception as e:
+            print(f"[SVG] Error: {e}")
+            raise
+
+    def transform_style_colors(self, style, base_rgb, params):
+        """Transform colors and opacity in SVG style attribute"""
+        # Early debug to verify inputs
+        print(f"[SVG Color] Starting transformation:")
+        print(f"[SVG Color] Input style: {style}")
+        print(f"[SVG Color] Base RGB: {base_rgb}")
+        print(f"[SVG Color] Parameters: {params}")
+
+        if not style:
+            return style
+
+        # Split into properties
+        properties = [p.strip() for p in style.split(';') if p.strip()]
+        modified_properties = []
+
+        try:
+            # Calculate final color
+            if base_rgb:
+                # Convert base color to HSL
+                base_h, base_s, base_l = rgb_to_hsl(*base_rgb)
+                print(f"[SVG Color] Base HSL: h={base_h:.1f}, s={base_s:.1f}, l={base_l:.1f}")
+
+                if params:
+                    # Get modifiers
+                    h_mod = float(params.get('h', 0))
+                    s_mod = float(params.get('s', 1.0))
+                    l_mod = float(params.get('l', 1.0))
+                    
+                    # Apply modifiers
+                    h = normalize_hue(base_h + h_mod)
+                    s = base_s * s_mod  # Multiply base saturation
+                    l = base_l * l_mod  # Multiply base lightness
+                    
+                    # Ensure valid ranges
+                    s = clip_value(s, 0, 100)
+                    l = clip_value(l, 0, 100)
+                    
+                    print(f"[SVG Color] Modified HSL: h={h:.1f}, s={s:.1f}, l={l:.1f}")
+                    print(f"[SVG Color] Applied modifiers: h+={h_mod}, s*={s_mod}, l*={l_mod}")
+                else:
+                    h, s, l = base_h, base_s, base_l
+
+                # Convert back to RGB
+                final_rgb = [int(x) for x in hsl_to_rgb(h, s, l)]
+                alpha = float(params.get('a', 1.0)) if params else 1.0
+                
+                print(f"[SVG Color] Final RGB: {final_rgb}, Alpha: {alpha}")
+            else:
+                # Direct color mode (RGB or HSL)
+                if isinstance(params, dict):
+                    if 'rgb' in params:
+                        final_rgb = params['rgb']
+                        alpha = params.get('a', 1.0)
+                    else:
+                        h = float(params.get('h', 0))
+                        s = float(params.get('s', 100))
+                        l = float(params.get('l', 50))
+                        final_rgb = [int(x) for x in hsl_to_rgb(h, s, l)]
+                        alpha = float(params.get('a', 1.0))
+
+            # Apply colors to style properties
+            for prop in properties:
+                if ':' not in prop:
+                    modified_properties.append(prop)
+                    continue
+
+                name, value = [x.strip() for x in prop.split(':', 1)]
+                
+                if name in ['fill', 'color', 'stroke'] and value.lower() != 'none':
+                    modified_properties.append(f"{name}: rgb({final_rgb[0]}, {final_rgb[1]}, {final_rgb[2]})")
+                    if abs(alpha - 1.0) > 0.001:
+                        modified_properties.append(f"{name}-opacity: {alpha:.3f}")
+                elif not name.endswith('-opacity'):
+                    modified_properties.append(f"{name}: {value}")
+
+            result = '; '.join(modified_properties)
+            print(f"[SVG Color] Final style: {result}")
+            return result
+
+        except Exception as e:
+            print(f"[SVG Color] Error during transformation: {e}")
+            return style
+
+
+        
+    def normalize_color_params(self, params):
+        """Normalize color parameters to ensure proper ranges"""
+        if not isinstance(params, dict):
+            return {'h': 0, 's': 100, 'l': 50, 'a': 1.0}
+            
+        normalized = {}
+        
+        # Handle hue (0-360)
+        normalized['h'] = normalize_hue(float(params.get('h', 0)))
+        
+        # Handle saturation (0-100%)
+        s_val = float(params.get('s', 1.0))
+        if s_val <= 2.0:  # Assuming multiplier format
+            normalized['s'] = clip_value(s_val * 100, 0, 100)
+        else:  # Assuming percentage format
+            normalized['s'] = clip_value(s_val, 0, 100)
+        
+        # Handle lightness (0-100%)
+        l_val = float(params.get('l', 1.0))
+        if l_val <= 2.0:  # Assuming multiplier format
+            normalized['l'] = clip_value(l_val * 100, 0, 100)
+        else:  # Assuming percentage format
+            normalized['l'] = clip_value(l_val, 0, 100)
+        
+        # Handle alpha (0-1)
+        a_val = float(params.get('a', 1.0))
+        if a_val > 1:  # Assuming 0-255 format
+            normalized['a'] = clip_value(a_val / 255, 0, 1)
+        else:  # Assuming 0-1 format
+            normalized['a'] = clip_value(a_val, 0, 1)
+        
+        if DEBUG_MODE:
+            print(f"[SVG] Normalizing params: {params}")
+            print(f"[SVG] Normalized result: {normalized}")
+        
+        return normalized
+
+        
 class StyleSheetLoader(Extension):
     pathChanged = pyqtSignal(str)
 
     def __init__(self, parent):
         super().__init__(parent)
-
         self.colorMode = Application.readSetting(PLUGIN_CONFIG, "colorMode", "HSL")
-
         self.startupStyleSheet = Application.readSetting(PLUGIN_CONFIG, "startupStyleSheet", "")
         self.path = self.startupStyleSheet
         self.useStartup = self.startupStyleSheet != ""
-
         self.customResourcePrefix = Application.readSetting(PLUGIN_CONFIG, "customResourcePrefix", "stylesheet")
         self.searchInStyleSheetDir = Application.readSetting(PLUGIN_CONFIG, "useStyleSheetDirAsResourcePath", "True") == "True"
-        
-        # Initialize the checkbox as a class variable
+        self.base_path = None
         self.useAsResourcePathCheckbox = QCheckBox()
-        # Update resource path on initialization
         self.updateResPath()
 
     def setup(self):
@@ -236,7 +441,7 @@ class StyleSheetLoader(Extension):
                         <td>If present in stylesheet. Syntax:</td>
                     </tr>
                     <tr style="background: palette(button); color: palette(button-text)">
-                        <td><center><code>color: QPalette.Highlight(h: -10, s: 1.4, l: 0.3, a: 0.8);</code></center></td>
+                        <td><code>&nbsp;&nbsp;&nbsp;&nbsp;color: QPalette.Highlight(h: -10, s: 1.4, l: 0.3, a: 0.8);</code></td>
                     </tr>
                     <tr>
                         <td>
@@ -247,12 +452,40 @@ class StyleSheetLoader(Extension):
                             &nbsp;&nbsp;&nbsp;&nbsp;a: Float - Alpha value</code><br>
                             &nbsp;&nbsp;<b>RGB:</b> <br>
                             <code>&nbsp;&nbsp;&nbsp;&nbsp;l: Float - Multiplier <br>
-                            &nbsp;&nbsp;&nbsp;&nbsp;a: Float - Alpha value</code>
+                            &nbsp;&nbsp;&nbsp;&nbsp;a: Float - Alpha value</code><br>
                         </td>
+                    </tr>
+                    <tr>
+                        <td><h3>SVG coloring</h3></td>
+                    </tr>
+                    <tr>
+                        <td>&nbsp;&nbsp;<b>QPalette:</b></td>
+                    </tr>            
+                    <tr  style="background: palette(button); color: palette(button-text)">
+                        <td><code>&nbsp;image: url(stylesheet:graphic.svg).QPalette.Highlight(h: 10, s: 2.4, l: 1.80, a: 1.0);</code></td>
+                    </tr>
+                    <tr>
+                        <td><br>Override SVG color:<br>
+                        &nbsp;&nbsp;<b>RGB/RGBA:</b></td>
+                    </tr>
+                    <tr  style="background: palette(button); color: palette(button-text)">
+                        <td><code>&nbsp;&nbsp;&nbsp;&nbsp;image: url(stylesheet:graphic.svg).rgb(123, 60, 84);</code></td>
+                    </tr>
+                    <tr  style="background: palette(button); color: palette(button-text)">
+                        <td><code>&nbsp;&nbsp;&nbsp;&nbsp;image: url(stylesheet:graphic.svg).rgba(123, 60, 84, 200);</code></td>
+                    </tr>
+                    <tr>
+                        <td>&nbsp;&nbsp;<b>HSL/HSLA:</b></td>
+                    </tr>
+                    <tr  style="background: palette(button); color: palette(button-text)">
+                        <td><code>&nbsp;&nbsp;&nbsp;&nbsp;image: url(stylesheet:graphic.svg).hsl(222, 84%, 60%);</code></td>
+                    </tr>
+                    <tr  style="background: palette(button); color: palette(button-text)">
+                        <td><code>&nbsp;&nbsp;&nbsp;&nbsp;image: url(stylesheet:graphic.svg).hsla(222, 84%, 60%, 100%);</code></td>
                     </tr>
                 </table>
             """
-        self.colorModeToolTipStylesheet = """QToolTip {padding: 2px; min-width: 474px; font-size: 13px;}"""
+        self.colorModeToolTipStylesheet = """QToolTip {padding: 2px; min-width: 690px; font-size: 13px;}"""
         colorModeLabel.setToolTip(self.colorModeToolTipString)
         colorModeLabel.setStyleSheet(self.colorModeToolTipStylesheet)
         self.colorModeCombo = QComboBox()
@@ -313,11 +546,11 @@ class StyleSheetLoader(Extension):
         self.importStylesheet(self.startupStyleSheet, addContext=True)
 
     def importStylesheet(self, path, addContext=False):
+        """Import and apply a stylesheet"""
         if not path:
             return
 
         try:
-            # Force update resource path before loading stylesheet
             self.updateResPath()
             
             if not QFileInfo(path).exists():
@@ -330,44 +563,71 @@ class StyleSheetLoader(Extension):
                 return
 
             file = QFile(path)
-            if file.open(QIODevice.ReadOnly):
-                data = file.readAll()
-                file.close()
-
-                self.updateResPath()
-
-                stylesheet = str(data, 'utf-8')
-                # Replace placeholders with RGB values
-                stylesheet = self.replace_placeholders(stylesheet)
-                # Correct image paths
-                stylesheet = self.correct_image_paths(stylesheet, os.path.dirname(path))
-                # Debugging: Print the stylesheet after replacing placeholders and correcting image paths
-                if PRINT_STYLESHEET:
-                    print("Stylesheet after processing:\n", stylesheet)
-                
-                # Apply the stylesheet
-                # Add safety check for active window
-                active_window = Application.activeWindow()
-                if active_window is not None and hasattr(active_window, 'qwindow'):
+            if file.open(QIODevice.ReadOnly | QIODevice.Text):
+                try:
+                    # Read QByteArray data
+                    qbytearray = file.readAll()
+                    
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] Raw data type: {type(qbytearray)}")
+                    
+                    # Convert QByteArray to Python string
                     try:
-                        active_window.qwindow().setStyleSheet(stylesheet)
-                    except Exception as e:
-                        print(f"Failed to set stylesheet: {e}")
-                else:
-                    print("No active window available to apply stylesheet")
+                        stylesheet = str(qbytearray, encoding='utf-8')
+                    except UnicodeDecodeError:
+                        # Fallback to system default encoding if UTF-8 fails
+                        stylesheet = str(qbytearray, encoding='ascii', errors='ignore')
+                    
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] Base path: {os.path.dirname(os.path.abspath(path))}")
+                        print(f"[DEBUG] Stylesheet length: {len(stylesheet)}")
+                        print(f"[DEBUG] Stylesheet type: {type(stylesheet)}")
+                    
+                    if PRINT_STYLESHEET and DEBUG_MODE:
+                        print("\nOriginal stylesheet:")
+                        print(stylesheet[:800])  # Print first 800 chars
+                    
+                    # Update base path for SVG processing
+                    self.base_path = os.path.dirname(os.path.abspath(path))
+                    
+                    # Process SVG URLs first
+                    processed_stylesheet = self.process_svg_urls(stylesheet, self.base_path)
+                    
+                    # Then replace color placeholders
+                    final_stylesheet = self.replace_placeholders(processed_stylesheet)
+                    
+                    if PRINT_STYLESHEET:
+                        print("\nProcessed stylesheet:\n", final_stylesheet)
+                        #print(final_stylesheet[:500])  # Print first 500 chars
+                    
+                    # Apply the stylesheet
+                    active_window = Application.activeWindow()
+                    if active_window is not None and hasattr(active_window, 'qwindow'):
+                        try:
+                            active_window.qwindow().setStyleSheet(final_stylesheet)
+                        except Exception as e:
+                            print(f"Failed to set stylesheet: {e}")
+                            raise
+                    else:
+                        print("No active window available to apply stylesheet")
 
-                self.setPath(path)
+                    self.setPath(path)
+                    
+                except Exception as e:
+                    print(f"Error processing stylesheet: {e}")
+                    raise
+                finally:
+                    file.close()
             else:
                 self.showWarningMessage("Failed to open \"%s\"." % (path), addContext)
                 
-             # Add debug information
             if DEBUG_MODE:
                 print(f"Resource paths for prefix '{self.customResourcePrefix}': {QDir.searchPaths(self.customResourcePrefix)}")
-            
+                
         except Exception as e:
             print(f"Error importing stylesheet: {e}")
             self.showWarningMessage(f"Error loading stylesheet: {str(e)}", addContext)
-            
+
     def showWarningMessage(self, warning, addContext):
         if addContext:
             warning = "Style Sheet Loader Extension: " + warning
@@ -521,6 +781,383 @@ class StyleSheetLoader(Extension):
             return f"url('{url}')"
 
         return pattern.sub(replace_url, stylesheet)
+        
+    def process_svg(self, input_path, output_path, palette_color, color_params):
+        """Process SVG file and save with modified colors"""
+        if DEBUG_MODE:
+            print(f"[SVG] Processing SVG:")
+            print(f"[SVG]   Input: {input_path}")
+            print(f"[SVG]   Output: {output_path}")
+            print(f"[SVG]   Palette Color: {palette_color}")
+            print(f"[SVG]   Color Params: {color_params}")
+
+        try:
+            # Parse SVG content
+            tree = ET.parse(input_path)
+            root = tree.getroot()
+            
+            if palette_color:
+                # Handle QPalette colors
+                base_rgb = get_palette_rgb_values()[palette_color]
+                params = parse_color_params(color_params)
+            else:
+                # Handle direct HSL/HSLA values
+                try:
+                    if isinstance(color_params, dict):
+                        params = color_params
+                        base_rgb = None  # Not needed for direct HSL values
+                    else:
+                        # Parse "h,s%,l%[,a]" format
+                        parts = [x.strip() for x in color_params.split(',')]
+                        params = {}
+                        
+                        # Parse hue
+                        params['h'] = float(parts[0].rstrip('°'))
+                        
+                        # Parse saturation
+                        s_val = parts[1].rstrip('%')
+                        params['s'] = float(s_val)
+                        
+                        # Parse lightness
+                        l_val = parts[2].rstrip('%')
+                        params['l'] = float(l_val)
+                        
+                        # Parse alpha if present
+                        if len(parts) >= 4:
+                            a_val = parts[3].rstrip('%')
+                            params['a'] = float(a_val) / 100.0 if '%' in parts[3] else float(a_val)
+                        else:
+                            params['a'] = 1.0
+                        
+                        base_rgb = None  # Not needed for direct HSL values
+                        
+                except Exception as e:
+                    print(f"[SVG] Error parsing color params: {e}")
+                    print(f"[SVG] Color params received: {color_params}")
+                    raise
+            
+            # Process all elements with style attributes
+            for elem in root.iter():
+                if 'style' in elem.attrib:
+                    style = elem.attrib['style']
+                    modified_style = self.transform_style_colors(style, base_rgb, params)
+                    elem.attrib['style'] = modified_style
+
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    
+            # Save processed SVG
+            tree.write(output_path, encoding='utf-8', xml_declaration=True)
+            
+            if DEBUG_MODE:
+                print(f"[SVG] Successfully saved processed SVG to: {output_path}")
+
+        except Exception as e:
+            print(f"[SVG] Error processing SVG: {e}")
+            raise
+            
+    def process_svg_urls(self, stylesheet, base_path):
+        """Process SVG URLs in stylesheet"""
+        if not isinstance(stylesheet, str):
+            print(f"[DEBUG] Invalid stylesheet type in process_svg_urls: {type(stylesheet)}")
+            return stylesheet
+            
+        if not base_path:
+            return stylesheet
+            
+        try:
+            if DEBUG_MODE:
+                print(f"[DEBUG] Processing SVG URLs with base path: {base_path}")
+                
+            self.base_path = base_path
+            svg_processor = SVGProcessor(
+                base_path, 
+                self.customResourcePrefix, 
+                self.searchInStyleSheetDir
+            )
+            
+            # Updated pattern to support all color formats
+            svg_pattern = re.compile(
+                r'(url\([\'"]?([^\'"\)]+\.svg)[\'"]?\))'  # Full URL and path
+                r'\s*\.\s*'  # Dot with optional whitespace
+                r'(?:'  # Non-capturing group for alternatives
+                r'QPalette\.(\w+)(?:\((.*?)\))?|'  # QPalette.Color(params)
+                r'hsla?\((.*?)\)|'  # hsl(params) or hsla(params)
+                r'rgba?\((.*?)\)'   # rgb(params) or rgba(params)
+                r')'
+            )
+            
+            def handle_svg_match(match):
+                if DEBUG_MODE:
+                    print("\n[SVG] Processing match:")
+                    print(f"[SVG] Full match: {match.group(0)}")
+                
+                url = match.group(2)
+                if not url:
+                    return match.group(0)
+                
+                try:
+                    # QPalette case
+                    if match.group(3):
+                        return self.process_qpalette(url, match.group(3), match.group(4))
+                    # HSL/HSLA case
+                    elif match.group(5):
+                        params = match.group(5)
+                        with_alpha = 'hsla' in match.group(0).lower()
+                        return self.process_hsl(url, params, with_alpha)
+                    # RGB/RGBA case
+                    elif match.group(6):
+                        params = match.group(6)
+                        with_alpha = 'rgba' in match.group(0).lower()
+                        return self.process_rgb(url, params, with_alpha)
+                except Exception as e:
+                    print(f"[SVG] Error processing match: {e}")
+                    return match.group(0)
+                
+                return match.group(0)
+            
+            return svg_pattern.sub(handle_svg_match, stylesheet)
+            
+        except Exception as e:
+            print(f"[DEBUG] Error in process_svg_urls: {e}")
+            return stylesheet
+
+
+    def process_qpalette(self, url, color, params):
+        """Process QPalette colors"""
+        try:
+            if DEBUG_MODE:
+                print(f"[QPalette] Processing: color={color}, params={params}")
+                print(f"[QPalette] Using color mode: {self.colorMode}")
+            
+            # Remove any existing prefix from the path
+            if url.startswith(f'{self.customResourcePrefix}:'):
+                url = url[len(f'{self.customResourcePrefix}:'):]
+            
+            # Get the base RGB values from the palette
+            base_rgb = get_palette_rgb_values()[color]
+            
+            if DEBUG_MODE:
+                print(f"[QPalette] Base RGB from palette: {base_rgb}")
+            
+            # Parse parameters if provided
+            if params:
+                try:
+                    # Parse parameters into a dict
+                    param_parts = re.findall(r'([hsla])\s*:\s*([-+]?\d*\.?\d+)', params)
+                    color_params = {}
+                    for key, value in param_parts:
+                        color_params[key] = float(value)
+                    
+                    if DEBUG_MODE:
+                        print(f"[QPalette] Parsed parameters: {color_params}")
+                    
+                    # Use the existing colorMode setting
+                    modified_rgb = list(base_rgb)  # Start with base RGB
+                    alpha = color_params.get('a', 1.0)  # Get alpha value early
+                    
+                    if self.colorMode == 'HSL': # HSL mode processing   
+                        h, s, l = rgb_to_hsl(*base_rgb)
+                        
+                        if 'h' in color_params:
+                            h = normalize_hue(h + color_params['h'])
+                        if 's' in color_params:
+                            s = clip_value(s * color_params['s'], 0, 100)
+                        if 'l' in color_params:
+                            l = clip_value(l * color_params['l'], 0, 100)
+                        
+                        modified_rgb = [int(x) for x in hsl_to_rgb(h, s, l)]
+                        
+                        if DEBUG_MODE:
+                            print(f"[QPalette] HSL mode - Modified HSL: h={h:.1f}, s={s:.1f}, l={l:.1f}")
+                            print(f"[QPalette] HSL mode - Modified RGB: {modified_rgb}, Alpha: {alpha}")
+                    
+                    else:  # RGB mode
+                        r, g, b = base_rgb
+
+                        if 'l' in color_params:
+                            l_multiplier = color_params.pop('l')  # Remove 'l' after getting its value
+                            r = clip_color_value(r * l_multiplier)
+                            g = clip_color_value(g * l_multiplier)
+                            b = clip_color_value(b * l_multiplier)
+                            modified_rgb = [r, g, b]
+                        else:
+                            modified_rgb = list(base_rgb)
+                        
+                                            
+                        if 'h' in color_params:
+                            color_params.pop("h")
+                        
+                        if 's' in color_params:
+                            color_params.pop("s")
+                        
+                        if DEBUG_MODE:
+                            print(f"[QPalette] RGB mode - Modified RGB: {modified_rgb}, Alpha: {alpha}")
+
+                        modified_rgb = [int(x) for x in modified_rgb]  # Ensure integer values
+                    
+                    color_params = {
+                        'rgb': [int(x) for x in modified_rgb],
+                        'a': alpha
+                    }
+                    
+                except Exception as e:
+                    if DEBUG_MODE:
+                        print(f"[QPalette] Error during color processing: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    # Don't reset to base_rgb on error, keep any successful modifications
+                    color_params = {
+                        'rgb': [int(x) for x in modified_rgb],
+                        'a': alpha
+                    }
+            else:
+                color_params = {'rgb': base_rgb, 'a': 1.0}
+                
+            if DEBUG_MODE:
+                print(f"[QPalette] Final color parameters: {color_params}")
+            
+            svg_processor = SVGProcessor(
+                self.base_path,
+                self.customResourcePrefix,
+                self.searchInStyleSheetDir
+            )
+            new_path = svg_processor.get_or_process_svg(url, None, color_params)
+            
+            if self.searchInStyleSheetDir:
+                new_path = f"{self.customResourcePrefix}:{new_path}"
+            
+            return f"url('{new_path}')"
+            
+        except Exception as e:
+            print(f"Error in process_qpalette: {e}")
+            if not url.startswith(f"{self.customResourcePrefix}:"):
+                url = f"{self.customResourcePrefix}:{url}"
+            return f"url('{url}')"
+
+
+    def adjust_rgb_saturation(r, g, b, s_multiplier):
+        """Adjust RGB saturation without converting to HSL"""
+        # Find the average value
+        avg = (r + g + b) / 3
+        
+        # Apply saturation multiplier
+        r = clip_color_value(avg + (r - avg) * s_multiplier)
+        g = clip_color_value(avg + (g - avg) * s_multiplier)
+        b = clip_color_value(avg + (b - avg) * s_multiplier)
+        
+        return [int(r), int(g), int(b)]
+
+
+    def process_hsl(self, url, params, with_alpha=False):
+        """Process HSL/HSLA colors"""
+        try:
+            # Handle both space and comma separated values
+            parts = [p.strip() for p in re.split(r'[,\s]+', params)]
+            
+            if DEBUG_MODE:
+                print(f"[HSL] Processing parts: {parts}")
+            
+            # Extract HSL and alpha values
+            if len(parts) >= 4:  # HSLA format
+                h, s, l, a = parts[:4]
+                with_alpha = True
+            elif len(parts) >= 3:  # HSL format
+                h, s, l = parts[:3]
+                a = "100%"
+            else:
+                raise ValueError(f"Not enough values in HSL/HSLA: {params}")
+            
+            # Parse color values
+            h = float(h.rstrip('°'))
+            s = float(s.rstrip('%'))
+            l = float(l.rstrip('%'))
+            
+            # Parse alpha
+            if '%' in str(a):
+                a = float(a.rstrip('%')) / 100.0
+            else:
+                a = float(a)
+            
+            color_params = {
+                'h': h,
+                's': s,
+                'l': l,
+                'a': clip_value(a, 0, 1)
+            }
+            
+            if DEBUG_MODE:
+                print(f"[HSL] Processing with params: {color_params}")
+            
+            svg_processor = SVGProcessor(
+                self.base_path,
+                self.customResourcePrefix,
+                self.searchInStyleSheetDir
+            )
+            new_path = svg_processor.get_or_process_svg(url, None, color_params)
+            
+            if self.searchInStyleSheetDir and not new_path.startswith(f"{self.customResourcePrefix}:"):
+                new_path = f"{self.customResourcePrefix}:{new_path}"
+            
+            return f"url('{new_path}')"
+        except Exception as e:
+            print(f"Error processing HSL/HSLA: {e}")
+            if not url.startswith(f"{self.customResourcePrefix}:"):
+                url = f"{self.customResourcePrefix}:{url}"
+            return f"url('{url}')"
+
+
+    def process_rgb(self, url, params, with_alpha=False):
+        """Process RGB/RGBA colors"""
+        try:
+            parts = [p.strip() for p in re.split(r'[,\s]+', params)]
+            
+            if DEBUG_MODE:
+                print(f"[RGB] Processing parts: {parts}")
+            
+            # Extract RGB and alpha values
+            if len(parts) >= 4:  # RGBA format
+                r, g, b, a = [float(x) for x in parts[:4]]
+                with_alpha = True
+            elif len(parts) >= 3:  # RGB format
+                r, g, b = [float(x) for x in parts[:3]]
+                a = 255.0
+            else:
+                raise ValueError(f"Not enough values in RGB/RGBA: {params}")
+            
+            # Ensure RGB values are in 0-255 range
+            r = clip_color_value(r)
+            g = clip_color_value(g)
+            b = clip_color_value(b)
+            
+            # Convert alpha to 0-1 range
+            alpha = clip_value(a / 255.0, 0, 1) if a > 1 else clip_value(a, 0, 1)
+            
+            color_params = {
+                'rgb': (int(r), int(g), int(b)),
+                'a': alpha
+            }
+            
+            if DEBUG_MODE:
+                print(f"[RGB] Processing with params: {color_params}")
+            
+            svg_processor = SVGProcessor(
+                self.base_path,
+                self.customResourcePrefix,
+                self.searchInStyleSheetDir
+            )
+            new_path = svg_processor.get_or_process_svg(url, None, color_params)
+            
+            if self.searchInStyleSheetDir:
+                new_path = f"{self.customResourcePrefix}:{new_path}"
+            
+            return f"url('{new_path}')"
+        except Exception as e:
+            print(f"Error processing RGB/RGBA: {e}")
+            if not url.startswith(f"{self.customResourcePrefix}:"):
+                url = f"{self.customResourcePrefix}:{url}"
+            return f"url('{url}')"
+
 
 # Example QSS content to test
 qss_content = """
@@ -639,7 +1276,7 @@ def test_color_transformations():
             print(f"{mode} mode result: {result}")
 
 # Run the tests
-if DEBUG_MODE:
+if __name__ == '__main__' and DEBUG_MODE:
     test_replace_placeholders()
     test_style_sheet_parser()
     test_color_transformations()
