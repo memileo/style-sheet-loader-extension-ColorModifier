@@ -219,7 +219,7 @@ class SVGProcessor:
         if not os.path.exists(output_path):
             self.process_svg(input_path, output_path, palette_color, color_params)
         
-        relative_path = os.path.relpath(output_path, self.base_path)
+        relative_path = os.path.relpath(output_path, self.base_path).replace("\\","/")
         
         if DEBUG_MODE:
             print(f"[SVG] Processed SVG path: {relative_path}")
