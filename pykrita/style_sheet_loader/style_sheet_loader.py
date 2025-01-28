@@ -666,21 +666,19 @@ class StyleSheetLoader(Extension):
         
     def updateResPath(self):
         try:
-            if self.searchInStyleSheetDir and self.startupStyleSheet:
-                resource_path = os.path.dirname(self.startupStyleSheet)
-                if os.path.exists(resource_path):
-                    QDir.setSearchPaths(self.customResourcePrefix, [resource_path])
-                    if DEBUG_MODE:
-                        print(f"Resource path set to: {resource_path}")
-                        # Verify the search paths were set
-                        current_paths = QDir.searchPaths(self.customResourcePrefix)
-                        print(f"Verified search paths: {current_paths}")
-                        # Verify if specific image files exist
-                        for img in ['close-light.svg', 'normal-light.svg', 'minimize-light.svg', 'maximize-light.svg']:
-                            full_path = os.path.join(resource_path, 'images', img)
-                            print(f"Checking image file: {full_path} - Exists: {os.path.exists(full_path)}")
+            if self.searchInStyleSheetDir:
+                # Use the current path if available, fall back to startup stylesheet
+                current_path = self.path or self.startupStyleSheet
+                if current_path:
+                    resource_path = os.path.dirname(current_path)
+                    if os.path.exists(resource_path):
+                        QDir.setSearchPaths(self.customResourcePrefix, [resource_path])
+                        if DEBUG_MODE:
+                            print(f"Resource path set to: {resource_path}")
+                    elif DEBUG_MODE:
+                        print(f"Warning: Resource path does not exist: {resource_path}")
                 elif DEBUG_MODE:
-                    print(f"Warning: Resource path does not exist: {resource_path}")
+                    print("No path available to set resource directory")
             else:
                 QDir.setSearchPaths(self.customResourcePrefix, [])
                 if DEBUG_MODE:
