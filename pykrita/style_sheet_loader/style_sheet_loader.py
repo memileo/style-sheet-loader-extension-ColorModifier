@@ -22,7 +22,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 from krita import Extension
 from PyQt5.QtWidgets import QFileDialog, QMessageBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QCheckBox, QApplication, QComboBox
-from PyQt5.QtGui import QPalette, QColor
+from PyQt5.QtGui import QPalette
 from PyQt5.QtCore import QFile, QIODevice, QMimeDatabase, QFileInfo, QDir, pyqtSignal
 
 EXTENSION_ID = 'pykrita_style_sheet_loader'
@@ -343,43 +343,6 @@ class SVGProcessor:
             return style
 
 
-        
-    def normalize_color_params(self, params):
-        """Normalize color parameters to ensure proper ranges"""
-        if not isinstance(params, dict):
-            return {'h': 0, 's': 100, 'l': 50, 'a': 1.0}
-            
-        normalized = {}
-        
-        # Handle hue (0-360)
-        normalized['h'] = normalize_hue(float(params.get('h', 0)))
-        
-        # Handle saturation (0-100%)
-        s_val = float(params.get('s', 1.0))
-        if s_val <= 2.0:  # Assuming multiplier format
-            normalized['s'] = clip_value(s_val * 100, 0, 100)
-        else:  # Assuming percentage format
-            normalized['s'] = clip_value(s_val, 0, 100)
-        
-        # Handle lightness (0-100%)
-        l_val = float(params.get('l', 1.0))
-        if l_val <= 2.0:  # Assuming multiplier format
-            normalized['l'] = clip_value(l_val * 100, 0, 100)
-        else:  # Assuming percentage format
-            normalized['l'] = clip_value(l_val, 0, 100)
-        
-        # Handle alpha (0-1)
-        a_val = float(params.get('a', 1.0))
-        if a_val > 1:  # Assuming 0-255 format
-            normalized['a'] = clip_value(a_val / 255, 0, 1)
-        else:  # Assuming 0-1 format
-            normalized['a'] = clip_value(a_val, 0, 1)
-        
-        if DEBUG_MODE:
-            print(f"[SVG] Normalizing params: {params}")
-            print(f"[SVG] Normalized result: {normalized}")
-        
-        return normalized
 
         
 class StyleSheetLoader(Extension):
@@ -548,11 +511,19 @@ class StyleSheetLoader(Extension):
     def importStylesheet(self, path, addContext=False):
         """Import and apply a stylesheet"""
         if not path:
+            if DEBUG_MODE:
+                print("not path")
             return
 
         try:
+            self.setPath(path)
+            if DEBUG_MODE:
+                print("self.setPath(path)", self.setPath(path))
+
             self.updateResPath()
-            
+            if DEBUG_MODE:
+                print("self.updateResPath()")
+
             if not QFileInfo(path).exists():
                 self.showWarningMessage(f"\"{path}\" does not exist!", addContext)
                 return
@@ -611,7 +582,6 @@ class StyleSheetLoader(Extension):
                     else:
                         print("No active window available to apply stylesheet")
 
-                    self.setPath(path)
                     
                 except Exception as e:
                     print(f"Error processing stylesheet: {e}")
@@ -745,40 +715,6 @@ class StyleSheetLoader(Extension):
         
         return pattern.sub(replace_match, stylesheet)
 
-    def correct_image_paths(self, stylesheet, base_path):
-        
-        # Ensures that any relative paths in the stylesheet are converted to the correct format
-        # using the resource prefix system.
-        
-        if DEBUG_MODE:
-            print(f"Processing stylesheet paths with base_path: {base_path}")
-            print(f"Current resource prefix: {self.customResourcePrefix}")
-            print(f"Search paths before correction: {QDir.searchPaths(self.customResourcePrefix)}")
-
-        pattern = re.compile(r'url\(([^)]+)\)')
-
-        def replace_url(match):
-            url = match.group(1).strip('\'"')
-            
-            # If the URL already starts with the resource prefix, leave it as is
-            if url.startswith(f'{self.customResourcePrefix}:'):
-                if DEBUG_MODE:
-                    print(f"URL already has prefix: {url}")
-                return f"url('{url}')"
-                
-            # If it's a relative path and we're using resource paths
-            if not os.path.isabs(url) and self.useAsResourcePathCheckbox.isChecked():
-                # Just add the resource prefix
-                url = f"{self.customResourcePrefix}:{url}"
-            else:
-                # For absolute paths or when not using resource system
-                url = os.path.join(base_path, url).replace('\\', '/')
-            
-            if DEBUG_MODE:
-                print(f"Corrected URL: {url}")
-            return f"url('{url}')"
-
-        return pattern.sub(replace_url, stylesheet)
         
     def process_svg(self, input_path, output_path, palette_color, color_params):
         """Process SVG file and save with modified colors"""
@@ -1034,19 +970,6 @@ class StyleSheetLoader(Extension):
             return f"url('{url}')"
 
 
-    def adjust_rgb_saturation(r, g, b, s_multiplier):
-        """Adjust RGB saturation without converting to HSL"""
-        # Find the average value
-        avg = (r + g + b) / 3
-        
-        # Apply saturation multiplier
-        r = clip_color_value(avg + (r - avg) * s_multiplier)
-        g = clip_color_value(avg + (g - avg) * s_multiplier)
-        b = clip_color_value(avg + (b - avg) * s_multiplier)
-        
-        return [int(r), int(g), int(b)]
-
-
     def process_hsl(self, url, params, with_alpha=False):
         """Process HSL/HSLA colors"""
         try:
@@ -1234,9 +1157,9 @@ def test_style_sheet_parser():
         print(f"Input: {test_case}")
         qss = test_qss % test_case
         # Create a StyleSheetLoader instance and process the stylesheet
-        # loader = StyleSheetLoader(None)
-        # result = loader.replace_placeholders(qss)
-        # print(f"Output: {result}")
+        loader = StyleSheetLoader(None)
+        result = loader.replace_placeholders(qss)
+        print(f"Output: {result}")
 
 # Function to test specific color transformations
 def test_color_transformations():
@@ -1274,7 +1197,7 @@ def test_color_transformations():
             print(f"{mode} mode result: {result}")
 
 # Run the tests
-if __name__ == '__main__' and DEBUG_MODE:
+if DEBUG_MODE:
     test_replace_placeholders()
     test_style_sheet_parser()
     test_color_transformations()
