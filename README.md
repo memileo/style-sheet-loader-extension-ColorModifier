@@ -35,15 +35,19 @@ QPalette.Highlight(h: -10, s: 1.4, l: 0.3, a: 0.8);
   l: Float - Multiplier <br>
   a: Float - Alpha value
 
+Modifiers are optional:
+```css
+QPalette.Highlight;
+```
 
 ### SVG:
 
-**QPalette:** <br>
+**QPalette color label:** <br>
 ```css
 image: url(stylesheet:graphic.svg).QPalette.Highlight(h: 10, s: 2.4, l: 1.80, a: 1.0);
 ```
 
-#### Override SVG color:
+#### Specific color:
 RGB/RGBA:
 ```css
 image: url(stylesheet:graphic.svg).rgb(123, 60, 84);
